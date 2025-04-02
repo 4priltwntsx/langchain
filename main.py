@@ -1,136 +1,114 @@
-import hashlib
-from typing import Dict, List
+from langchain.graphs import Graph
+from langchain_core.documents import Document
+from retrieval_grader import RetrievalGrader
+from hallucination_grader import HallucinationGrader
+from grade_documents import GradeDocuments
+from generate import Generate
+from ResultCache import ResultCache
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from your_vector_db_client import VectorDBClient
 
-# 캐시 클래스 정의
-class ResultCache:
-    def __init__(self):
-        self.cache: Dict[str, str] = {}
+## 이 코드는 results-modules-02/를 사용했음.
 
-    def _hash_key(self, question: str) -> str:
-        """질문을 해시하여 고유 키 생성"""
-        return hashlib.sha256(question.encode()).hexdigest()
 
-    def get(self, question: str) -> str:
-        """캐시에서 결과 가져오기"""
-        key = self._hash_key(question)
-        return self.cache.get(key)
+# LLM 모델 초기화
+MODEL_NAME = "gpt-4"
+llm = ChatOpenAI(model=MODEL_NAME, temperature=0)
 
-    def set(self, question: str, response: str):
-        """캐시에 결과 저장"""
-        key = self._hash_key(question)
-        self.cache[key] = response
+# 평가기 초기화
+retrieval_grader = RetrievalGrader(model_name=MODEL_NAME, temperature=0)
+hallucination_grader = HallucinationGrader(model_name=MODEL_NAME, temperature=0)
 
-    def clear(self):
-        """캐시 초기화"""
-        self.cache.clear()
-
-# 캐시 인스턴스 생성
+# 캐시 초기화
 result_cache = ResultCache()
 
-# LLM 초기화
-llm = ChatOpenAI(model_name="gpt-4", temperature=0)
+# LangGraph 그래프 생성
+graph = Graph()
 
-# 할루시네이션 검출 프롬프트 템플릿
-hallucination_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", "You are a fact-checker. Verify if the following response aligns with the provided documents."),
-        ("human", "Response: \n\n {response} \n\n Relevant documents: \n\n {documents}"),
-    ]
-)
-hallucination_chain = hallucination_prompt | llm | StrOutputParser()
+# 상태값 초기화
+state = {
+    "question": "What are the latest advancements in AI research?",
+    "documents": [
+        Document(
+            page_content="Recent studies in AI have focused on generative models like GPT-4.",
+            metadata={"source": "AI Journal", "page": 0},
+        ),
+        Document(
+            page_content="Advancements in reinforcement learning have also been significant.",
+            metadata={"source": "RL Conference", "page": 1},
+        ),
+    ],
+}
 
-# 벡터 데이터베이스 초기화
-vector_db = VectorDBClient()
+# 노드 정의
+def retrieve_node(state):
+    """문서 검색 노드"""
+    print("==== [RETRIEVE NODE] ====")
+    return state  # 이미 초기화된 문서를 사용하므로 그대로 반환
 
-# 문서 포맷팅 함수
-def format_docs(documents: List[Dict]) -> str:
-    """문서를 포맷팅하여 문자열로 변환"""
-    return "\n\n".join(
-        [
-            f'<document><content>{doc["content"]}</content><source>{doc["metadata"]["source"]}</source></document>'
-            for doc in documents
-        ]
-    )
 
-# RAG 응답 생성 함수
-def generate_response_with_cache(question: str, documents: List[Dict]) -> str:
-    """
-    캐시를 활용하여 RAG 응답을 생성합니다.
+def grade_documents_node(state):
+    """문서 관련성 평가 노드"""
+    print("==== [GRADE DOCUMENTS NODE] ====")
+    grader = GradeDocuments(retrieval_grader)
+    return grader.execute(state)
 
-    Args:
-        question (str): 사용자 질문.
-        documents (list): 검색된 문서 리스트.
 
-    Returns:
-        str: 생성된 응답.
-    """
-    # 캐시에서 결과 확인
+def generate_node(state):
+    """답변 생성 노드"""
+    print("==== [GENERATE NODE] ====")
+    question = state["question"]
+
+    # 캐시 확인
     cached_response = result_cache.get(question)
     if cached_response:
-        print("Returning cached response.")
-        return cached_response
+        print("Cache hit: Returning cached response.")
+        state["generation"] = cached_response
+        return state
 
-    # 캐시에 결과가 없으면 RAG 체인 실행
-    formatted_docs = format_docs(documents)
-    response_prompt = ChatPromptTemplate.from_messages(
+    # RAG 체인 초기화
+    prompt = ChatPromptTemplate.from_messages(
         [
             ("system", "You are an assistant generating answers based on relevant documents."),
-            ("human", "Relevant documents: \n\n {documents} \n\n User question: {question}"),
+            ("human", "Relevant documents: \n\n {context} \n\n User question: {question}"),
         ]
     )
-    response_chain = response_prompt | llm
-    response = response_chain.invoke({
-        "documents": formatted_docs,
-        "question": question,
-    })
+    rag_chain = prompt | llm
+    generator = Generate(rag_chain)
 
-    # 결과를 캐시에 저장
-    result_cache.set(question, response)
-    return response
-
-# 할루시네이션 검출 함수
-def detect_hallucination(response: str, relevant_documents: List[Dict]) -> dict:
-    """
-    LLM 응답이 관련 문서와 일치하는지 검증합니다.
-
-    Args:
-        response (str): LLM이 생성한 응답.
-        relevant_documents (list): 관련 문서 리스트.
-
-    Returns:
-        dict: 검증 결과와 신뢰도 점수.
-    """
-    formatted_docs = format_docs(relevant_documents)
-    result = hallucination_chain.invoke({
-        "response": response,
-        "documents": formatted_docs,
-    })
+    # 답변 생성
+    result = generator.execute(state)
+    result_cache.set(question, result["generation"])  # 캐시에 저장
     return result
 
-# 메인 워크플로우
-def main():
-    # 사용자 질문
-    user_question = "What is the capital of France?"
 
-    # 벡터 데이터베이스에서 문서 검색
-    retrieved_documents = vector_db.search(query=user_question, top_k=5)
+def hallucination_check_node(state):
+    """환각 여부 평가 노드"""
+    print("==== [HALLUCINATION CHECK NODE] ====")
+    documents = state["documents"]
+    generation = state["generation"]
+    hallucination_score = hallucination_grader.evaluate(documents, generation)
+    print(f"Hallucination Score: {hallucination_score}")
+    state["hallucination_score"] = hallucination_score
+    return state
 
-    # 관련 문서 필터링 (간단한 예제에서는 모든 문서를 사용)
-    relevant_documents = retrieved_documents
 
-    # RAG 응답 생성
-    response = generate_response_with_cache(user_question, relevant_documents)
+# 그래프 노드 추가
+graph.add_node("Retrieve", retrieve_node)
+graph.add_node("GradeDocuments", grade_documents_node)
+graph.add_node("Generate", generate_node)
+graph.add_node("HallucinationCheck", hallucination_check_node)
 
-    # 할루시네이션 검출 실행
-    hallucination_result = detect_hallucination(response, relevant_documents)
+# 그래프 엣지 정의
+graph.add_edge("Retrieve", "GradeDocuments")
+graph.add_edge("GradeDocuments", "Generate")
+graph.add_edge("Generate", "HallucinationCheck")
 
-    # 결과 출력
-    print("Generated Response:", response)
-    print("Hallucination Detection Result:", hallucination_result)
+# 그래프 실행
+final_state = graph.run("Retrieve", state)
 
-if __name__ == "__main__":
-    main()
+# 최종 결과 출력
+print("\n==== [FINAL RESULT] ====")
+print(f"Question: {final_state['question']}")
+print(f"Generated Answer: {final_state['generation']}")
+print(f"Hallucination Score: {final_state['hallucination_score']}")
